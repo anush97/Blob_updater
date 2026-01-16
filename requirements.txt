@@ -1,3 +1,135 @@
-Flask==3.0.3
-azure-storage-blob==12.22.0
-pandas==2.2.2
+import json
+import logging
+import os
+from typing import Dict, Any, Optional
+
+from common.models.data_pipeline_metadata_model import DataPipelineMetadataModel
+from common.utils.decorator import lambda_handler
+from common.utils.validators import validate_env_variables
+from common.utils.constants import PROVINCE_REGION_MAP
+
+logger = logging.getLogger()
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+
+
+class FilterDocuments:
+    def __init__(self, event_model: DataPipelineMetadataModel):
+        self.event_model = event_model
+
+    def is_region_valid(self) -> bool:
+        """
+        Check if the document's region matches the expected region logic.
+        """
+        metadata = self.event_model.metadata
+        document_provinces = metadata["province"]
+        document_evaluated_regions = {
+            PROVINCE_REGION_MAP[province.upper()] for province in document_provinces
+        }
+
+        if self.event_model.docum_region.upper() in document_evaluated_regions:
+            return True
+
+        logger.info(
+            f"Document {metadata['unid']} blocked: region '{self.event_model.docum_region.upper()}' "
+            f"does not match '{document_evaluated_regions}'."
+        )
+        return False
+
+    def is_language_supported(self, supported_languages: list[str]) -> bool:
+        """
+        Check if the document's language is supported.
+        """
+        language = self.event_model.metadata["language"].lower()
+        if language not in supported_languages:
+            logger.info(
+                f"Document {self.event_model.metadata['unid']} blocked: unsupported language '{language}'."
+            )
+            return False
+        return True
+
+    def has_minimum_content_length(self, min_html: int, min_pdf: int) -> bool:
+        """
+        Check if the document meets the minimum content length.
+        """
+        required_length = min_html if self.event_model.content_type == "html" else min_pdf
+
+        # Guard: extracted_text_length can be None
+        if self.event_model.extracted_text_length is None:
+            logger.info(
+                f"Document {self.event_model.metadata['unid']} blocked: extracted_text_length is missing."
+            )
+            return False
+
+        if self.event_model.extracted_text_length < required_length:
+            logger.info(
+                f"Document {self.event_model.metadata['unid']} blocked: insufficient content length."
+            )
+            return False
+        return True
+
+
+def build_handler() -> Any:
+    validate_env_variables("MINIMUM_CHAR_LENGTH_PDF", "MINIMUM_CHAR_LENGTH_HTML")
+    minimum_char_length_pdf = int(os.environ.get("MINIMUM_CHAR_LENGTH_PDF"))
+    minimum_char_length_html = int(os.environ.get("MINIMUM_CHAR_LENGTH_HTML"))
+
+    @lambda_handler(logging_fn=logger.error)
+    def handler(
+        event: Dict[str, Any], context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        logger.info(f"Event received: {json.dumps(event)}")
+
+        event_model = DataPipelineMetadataModel(**event)
+        filter_instance = FilterDocuments(event_model)
+
+        # 1) Region validation
+        if not filter_instance.is_region_valid():
+            event["process"] = "BLOCK"
+            return event
+
+        # 2) Language validation (per-region list comes from the event model)
+        pipeline_languages = event_model.supported_languages
+
+        # Missing list => BLOCK (this should be provided by Step Function / previous lambda)
+        if pipeline_languages is None:
+            logger.error("Event supported_languages is not set; blocking document.")
+            event["process"] = "BLOCK"
+            return event
+
+        if not isinstance(pipeline_languages, list):
+            raise ValueError("Event supported_languages must be a list.")
+
+        pipeline_languages = [
+            str(lang).strip().lower()
+            for lang in pipeline_languages
+            if lang is not None and str(lang).strip()
+        ]
+
+        if not pipeline_languages:
+            logger.error("Event supported_languages is empty after normalization; blocking document.")
+            event["process"] = "BLOCK"
+            return event
+
+        if not filter_instance.is_language_supported(pipeline_languages):
+            event["process"] = "BLOCK"
+            return event
+
+        # 3) Content length validation
+        if not filter_instance.has_minimum_content_length(
+            minimum_char_length_html, minimum_char_length_pdf
+        ):
+            event["process"] = "BLOCK"
+            return event
+
+        logger.info(
+            f"Document {event_model.metadata['unid']} passed all filters. "
+            f"Pipeline_region: {event_model.docum_region}"
+        )
+        event["process"] = "CONTINUE"
+        return event
+
+    return handler
+
+
+if not bool(os.environ.get("TEST_FLAG", False)):
+    handler = build_handler()
