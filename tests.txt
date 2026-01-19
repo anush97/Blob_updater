@@ -1,0 +1,612 @@
+import os
+
+import pytest
+
+from common.adapters.s3_adapter import S3Adapter
+from common.models.data_pipeline_metadata_model import DataPipelineMetadataModel
+from lambdas.metadata_extractor.metadata_extractor_handler import (
+    build_handler,
+    RawJsonDocumentProcessor,
+)
+from tests.fixtures.s3_client import s3_client
+from tests.fixtures.test_raw_json_files import build_raw_html_json, build_raw_pdf_json
+
+TEST_S3_BUCKET_NAME = "test-bucket"
+TEST_S3_KEY_PREFIX = "agent-assist-qna-resources/raw_data/"
+REQUIRED_FIELDS = ["Province", "res_title"]
+ONTARIO_ATLANTIC_BASE_HTML_URL = "https://test-domino/html-url/"
+ONTARIO_ATLANTIC_BASE_PDF_URL = "https://test-domino/pdf-url/"
+WEST_BASE_HTML_URL = "https://test-domino/html-url/"
+WEST_BASE_PDF_URL = "https://test-domino/pdf-url/"
+
+DEFAULT_SUPPORTED_LANGUAGES = ["english", "unsure"]
+
+TEST_SCENARIOS = [
+    # Ontario
+    {
+        "docum_uuid": "100000",
+        "docum_region": "on",
+        "province": ["ON"],
+        "docum_title": "Test_HTML_Document_Title",
+        "filename": "Test_HTML_Document_Title",
+        "base_url": ONTARIO_ATLANTIC_BASE_HTML_URL,
+        "content_type": "html",
+        "raw_json": build_raw_html_json(
+            unid="100000", province="ON", langue="en", title="Test_HTML_Document_Title"
+        ),
+    },
+    {
+        "docum_uuid": "100001",
+        "docum_region": "on",
+        "province": ["ON"],
+        "docum_title": "Test_PDF_Document_Title",
+        "filename": "Test PDF Document Title_v1.pdf",
+        "base_url": ONTARIO_ATLANTIC_BASE_PDF_URL,
+        "content_type": "pdf",
+        "raw_json": build_raw_pdf_json(
+            unid="100001",
+            province="ON",
+            langue="en",
+            title="Test_PDF_Document_Title",
+            filename="Test PDF Document Title_v1.pdf",
+        ),
+    },
+    # Atlantic
+    {
+        "docum_uuid": "200000",
+        "docum_region": "atl",
+        "province": ["ATL"],
+        "docum_title": "Test_HTML_Document_Title",
+        "filename": "Test_HTML_Document_Title",
+        "base_url": ONTARIO_ATLANTIC_BASE_HTML_URL,
+        "content_type": "html",
+        "raw_json": build_raw_html_json(
+            unid="200000", province="ATL", langue="en", title="Test_HTML_Document_Title"
+        ),
+    },
+    {
+        "docum_uuid": "200001",
+        "docum_region": "atl",
+        "province": ["ON"],
+        "docum_title": "Test_PDF_Document_Title",
+        "filename": "Test PDF Document Title_v1.pdf",
+        "base_url": ONTARIO_ATLANTIC_BASE_PDF_URL,
+        "content_type": "pdf",
+        "raw_json": build_raw_pdf_json(
+            unid="200001",
+            province="ON",
+            langue="en",
+            title="Test_PDF_Document_Title",
+            filename="Test PDF Document Title_v1.pdf",
+        ),
+    },
+    # ON + ATL provinces list
+    {
+        "docum_uuid": "300000",
+        "docum_region": "atl",
+        "province": ["ON", "NB"],
+        "docum_title": "Test_HTML_Document_Title",
+        "filename": "Test_HTML_Document_Title",
+        "base_url": WEST_BASE_HTML_URL,
+        "content_type": "html",
+        "raw_json": build_raw_html_json(
+            unid="300000",
+            province=["ON", "NB"],
+            langue="en",
+            title="Test_HTML_Document_Title",
+        ),
+    },
+    {
+        "docum_uuid": "300001",
+        "docum_region": "atl",
+        "province": ["ON", "NB"],
+        "docum_title": "Test_PDF_Document_Title",
+        "filename": "Test PDF Document Title_v1.pdf",
+        "base_url": WEST_BASE_PDF_URL,
+        "content_type": "pdf",
+        "raw_json": build_raw_pdf_json(
+            unid="300001",
+            province=["ON", "NB"],
+            langue="en",
+            title="Test_PDF_Document_Title",
+            filename="Test PDF Document Title_v1.pdf",
+        ),
+    },
+    # West
+    {
+        "docum_uuid": "400000",
+        "docum_region": "west",
+        "province": ["AB"],
+        "docum_title": "Test_HTML_Document_Title",
+        "filename": "Test_HTML_Document_Title",
+        "base_url": WEST_BASE_HTML_URL,
+        "content_type": "html",
+        "raw_json": build_raw_html_json(
+            unid="400000",
+            province="AB",
+            langue="en",
+            title="Test_HTML_Document_Title",
+        ),
+    },
+    {
+        "docum_uuid": "400001",
+        "docum_region": "west",
+        "province": ["AB", "BC"],
+        "docum_title": "Test_PDF_Document_Title",
+        "filename": "Test PDF Document Title_v1.pdf",
+        "base_url": WEST_BASE_PDF_URL,
+        "content_type": "pdf",
+        "raw_json": build_raw_pdf_json(
+            unid="400001",
+            province=["AB", "BC"],
+            langue="en",
+            title="Test_PDF_Document_Title",
+            filename="Test PDF Document Title_v1.pdf",
+        ),
+    },
+]
+
+
+def __create_sample_event(region: str, uuid: str, supported_languages=None):
+    if supported_languages is None:
+        supported_languages = DEFAULT_SUPPORTED_LANGUAGES
+
+    return {
+        "S3ObjectContent": {
+            "ChecksumAlgorithm": ["test_algorithm"],
+            "ChecksumType": "123456",
+            "ETag": '"123"',
+            "Key": f"{TEST_S3_KEY_PREFIX}{uuid}.json",
+            "LastModified": "2025-02-25T20:29:38Z",
+            "Size": 14230,
+            "StorageClass": "test_storage_class",
+        },
+        "DocumRegion": region,
+        "SupportedLanguages": supported_languages,  # ✅ new
+    }
+
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_env():
+    os.environ["DATA_BUCKET_NAME"] = TEST_S3_BUCKET_NAME
+    os.environ["REQUIRED_FIELDS"] = str(REQUIRED_FIELDS)
+    os.environ["ONTARIO_ATLANTIC_BASE_HTML_URL"] = ONTARIO_ATLANTIC_BASE_HTML_URL
+    os.environ["ONTARIO_ATLANTIC_BASE_PDF_URL"] = ONTARIO_ATLANTIC_BASE_PDF_URL
+    os.environ["WEST_BASE_HTML_URL"] = WEST_BASE_HTML_URL
+    os.environ["WEST_BASE_PDF_URL"] = WEST_BASE_PDF_URL
+
+
+@pytest.fixture
+def s3_adapter(s3_client):
+    s3_client.create_bucket(Bucket=TEST_S3_BUCKET_NAME)
+    return S3Adapter(s3_client)
+
+
+@pytest.fixture
+def handler(setup_env, s3_adapter):
+    return build_handler(s3_adapter)
+
+
+@pytest.fixture
+def raw_json_processor():
+    return RawJsonDocumentProcessor(
+        bucket_name=TEST_S3_BUCKET_NAME,
+        required_fields=REQUIRED_FIELDS,
+        ontario_atlantic_base_html_url=ONTARIO_ATLANTIC_BASE_HTML_URL,
+        ontario_atlantic_base_pdf_url=ONTARIO_ATLANTIC_BASE_PDF_URL,
+        west_base_html_url=WEST_BASE_HTML_URL,
+        west_base_pdf_url=WEST_BASE_PDF_URL,
+    )
+
+
+@pytest.mark.parametrize("test_event", TEST_SCENARIOS)
+def test_handler_success(s3_adapter, handler, test_event):
+    s3_adapter.try_save_json_object(
+        bucket_name=TEST_S3_BUCKET_NAME,
+        key=f"{TEST_S3_KEY_PREFIX}{test_event['docum_uuid']}.json",
+        body=test_event["raw_json"],
+    )
+
+    sample_event = __create_sample_event(
+        region=test_event["docum_region"],
+        uuid=test_event["docum_uuid"],
+        supported_languages=DEFAULT_SUPPORTED_LANGUAGES,
+    )
+    response = handler(sample_event)
+
+    expected_url_suffix = (
+        test_event["docum_title"]
+        if test_event["content_type"] == "html"
+        else test_event["docum_uuid"]
+        + "/%24File/"
+        + test_event["filename"].replace(" ", "%20")
+    )
+
+    expected_response = {
+        "metadata": {
+            "unid": test_event["docum_uuid"],
+            "province": test_event["province"],
+            "region": test_event["docum_region"],
+            "title": test_event["docum_title"],
+            "file_name": test_event["filename"],
+            "url": f"{test_event['base_url']}{expected_url_suffix}",
+            "subject": "Test Document Title",
+            "category": ["Test Category"],
+            "section_name": ["Test Section"],
+            "subsection_name": None,
+            "language": "en",
+            "status": "Published",
+        },
+        "raw_path": f"s3://{TEST_S3_BUCKET_NAME}/{TEST_S3_KEY_PREFIX}{test_event['docum_uuid']}.json",
+        "content_type": test_event["content_type"],
+        "content_path": None,
+        "process": None,
+        "docum_region": test_event["docum_region"],
+        "region_prefix": f"regions/{test_event['docum_region']}/",
+        "extracted_text_length": None,
+        "supported_languages": DEFAULT_SUPPORTED_LANGUAGES,  # ✅ new
+    }
+
+    assert response == expected_response
+
+
+def test_handler_missing_required_field(handler, s3_adapter):
+    raw_json = {"Body": {"content": []}}
+    s3_adapter.try_save_json_object(
+        bucket_name=TEST_S3_BUCKET_NAME,
+        key=f"{TEST_S3_KEY_PREFIX}missing_field.json",
+        body=raw_json,
+    )
+    event = {
+        "S3ObjectContent": {"Key": f"{TEST_S3_KEY_PREFIX}missing_field.json"},
+        "DocumRegion": "on",
+        "SupportedLanguages": DEFAULT_SUPPORTED_LANGUAGES,
+    }
+
+    with pytest.raises(KeyError) as exc_info:
+        _ = handler(event)
+
+    assert "missing" in str(exc_info.value).lower()
+
+
+def test_handler_invalid_region(handler, s3_adapter):
+    raw_json = build_raw_html_json(
+        unid="999999", province="ON", langue="en", title="Invalid_Region"
+    )
+    s3_adapter.try_save_json_object(
+        bucket_name=TEST_S3_BUCKET_NAME,
+        key=f"{TEST_S3_KEY_PREFIX}999999.json",
+        body=raw_json,
+    )
+    event = {
+        "S3ObjectContent": {"Key": f"{TEST_S3_KEY_PREFIX}999999.json"},
+        "DocumRegion": "invalid",
+        "SupportedLanguages": DEFAULT_SUPPORTED_LANGUAGES,
+    }
+    with pytest.raises(ValueError) as exc_info:
+        _ = handler(event)
+
+    assert "Unsupported region" in str(exc_info.value)
+
+
+def test_handler_missing_s3_object_content(handler):
+    event = {"DocumRegion": "on", "SupportedLanguages": DEFAULT_SUPPORTED_LANGUAGES}
+    with pytest.raises(ValueError) as exc_info:
+        _ = handler(event)
+
+    assert "S3ObjectContent" in str(exc_info.value)
+
+
+def test_handler_missing_docum_region(handler):
+    event = {
+        "S3ObjectContent": {"Key": "key"},
+        "SupportedLanguages": DEFAULT_SUPPORTED_LANGUAGES,
+    }
+    with pytest.raises(ValueError) as exc_info:
+        _ = handler(event)
+
+    assert "DocumRegion" in str(exc_info.value)
+
+
+def test_handler_invalid_content_type(handler, s3_adapter):
+    raw_json = {
+        "Province": "ON",
+        "res_title": "test-title",
+        "Body": {"content": [{"contentType": "text/plain", "data": "not html"}]},
+    }
+    s3_adapter.try_save_json_object(
+        bucket_name=TEST_S3_BUCKET_NAME,
+        key=f"{TEST_S3_KEY_PREFIX}bad_content.json",
+        body=raw_json,
+    )
+    event = {
+        "S3ObjectContent": {"Key": f"{TEST_S3_KEY_PREFIX}bad_content.json"},
+        "DocumRegion": "on",
+        "SupportedLanguages": DEFAULT_SUPPORTED_LANGUAGES,
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        _ = handler(event)
+
+    assert "content must either be 'html' or 'pdf'" in str(exc_info.value)
+
+
+def test_build_model_with_valid_html_content(raw_json_processor):
+    json_object = {
+        "Province": "on",
+        "Subject": "subject",
+        "Langue": "language",
+        "Status": "status",
+        "Body": {
+            "content": [
+                {"contentType": "text/html", "data": "<html><body>Test</body></html>"}
+            ]
+        },
+        "res_title": "test-title",
+        "@unid": "12345",
+    }
+    result = raw_json_processor.build_model(
+        "on",
+        json_object,
+        "test-key",
+        supported_languages=DEFAULT_SUPPORTED_LANGUAGES,
+    )
+    assert isinstance(result, DataPipelineMetadataModel)
+    assert result.content_type == "html"
+    assert result.docum_region == "on"
+
+
+def test_build_model_with_valid_pdf_content(raw_json_processor):
+    json_object = {
+        "Province": "AB",
+        "Subject": "subject",
+        "Langue": "language",
+        "Status": "status",
+        "Body": {
+            "content": [
+                {
+                    "contentType": "application/pdf;name=test file.pdf",
+                    "contentDisposition": "attachment;filename=test file.pdf",
+                    "contentTransferEncoding": "base64",
+                }
+            ]
+        },
+        "EmbedPDF": "1",
+        "res_title": "test-title",
+        "@unid": "12345",
+    }
+    result = raw_json_processor.build_model(
+        "west",
+        json_object,
+        "test-key",
+        supported_languages=DEFAULT_SUPPORTED_LANGUAGES,
+    )
+    assert isinstance(result, DataPipelineMetadataModel)
+    assert result.content_type == "pdf"
+    assert result.docum_region == "west"
+
+
+def test_build_model_with_unsupported_region(raw_json_processor):
+    json_object = {
+        "Province": "province",
+        "res_title": "title",
+        "Body": {
+            "content": [
+                {"contentType": "text/html", "data": "<html><body>Test</body></html>"}
+            ]
+        },
+        "@unid": "12345",
+    }
+    with pytest.raises(ValueError, match="Unsupported region: invalid. Supported regions are"):
+        raw_json_processor.build_model(
+            "invalid",
+            json_object,
+            "test-key",
+            supported_languages=DEFAULT_SUPPORTED_LANGUAGES,
+        )
+
+
+def test_build_model_with_missing_required_field(raw_json_processor):
+    json_object = {
+        "res_title": "title",
+        "Body": {
+            "content": [
+                {"contentType": "text/html", "data": "<html><body>Test</body></html>"}
+            ]
+        },
+        "@unid": "12345",
+    }
+    with pytest.raises(KeyError, match="Field 'Province' is missing"):
+        raw_json_processor.build_model(
+            "on",
+            json_object,
+            "test-key",
+            supported_languages=DEFAULT_SUPPORTED_LANGUAGES,
+        )
+
+
+def test_build_model_with_invalid_content_type(raw_json_processor):
+    json_object = {
+        "Province": "province",
+        "res_title": "title",
+        "Body": {"content": [{"contentType": "text/plain", "data": "Invalid content"}]},
+        "@unid": "12345",
+    }
+    with pytest.raises(ValueError, match="Value content must either be 'html' or 'pdf'"):
+        raw_json_processor.build_model(
+            "on",
+            json_object,
+            "test-key",
+            supported_languages=DEFAULT_SUPPORTED_LANGUAGES,
+        )
+-------
+import copy
+
+import pytest
+
+from lambdas.document_filter.document_filter_handler import build_handler
+
+UNID = "unid-12345"
+
+DEFAULT_SUPPORTED_LANGUAGES = ["english", "unsure"]
+
+
+# ---------------- Fixtures ---------------- #
+@pytest.fixture(autouse=True)
+def setup_env(monkeypatch):
+    # ✅ SUPPORTED_LANGUAGES env var no longer used
+    monkeypatch.setenv("MINIMUM_CHAR_LENGTH_PDF", "10")
+    monkeypatch.setenv("MINIMUM_CHAR_LENGTH_HTML", "250")
+
+
+@pytest.fixture
+def handler():
+    return build_handler()
+
+
+@pytest.fixture
+def valid_event():
+    return {
+        "metadata": {
+            "unid": UNID,
+            "region": "on",
+            "province": ["ON"],
+            "title": "DocTitle",
+            "file_name": f"{UNID}.html",
+            "url": "http://example.com",
+            "subject": "Subj",
+            "category": "Cat",
+            "section_name": "Sec",
+            "subsection_name": "Subsec",
+            "language": "english",
+            "status": "Published",
+        },
+        "raw_path": "s3://test_bucket/inputs/test_html.json",
+        "content_type": "html",
+        "content_path": None,
+        "process": None,
+        "docum_region": "on",
+        "region_prefix": "regions/on/",
+        "extracted_text_length": 500,
+        "supported_languages": DEFAULT_SUPPORTED_LANGUAGES,  # ✅ required now
+    }
+
+
+# ---------------- Tests: Supported languages presence/type ---------------- #
+def test_handler_blocks_when_supported_languages_missing(handler, valid_event):
+    event = copy.deepcopy(valid_event)
+    event.pop("supported_languages")
+
+    resp = handler(event)
+    assert resp["process"] == "BLOCK"
+
+
+def test_handler_blocks_when_supported_languages_empty(handler, valid_event):
+    event = copy.deepcopy(valid_event)
+    event["supported_languages"] = []
+
+    resp = handler(event)
+    assert resp["process"] == "BLOCK"
+
+
+def test_handler_raises_when_supported_languages_not_list(handler, valid_event):
+    event = copy.deepcopy(valid_event)
+    event["supported_languages"] = "english"
+
+    with pytest.raises(ValueError, match="supported_languages must be a list"):
+        _ = handler(event)
+
+
+# ---------------- Tests: Language validation ---------------- #
+def test_handler_blocks_when_language_not_supported(handler, valid_event):
+    event = copy.deepcopy(valid_event)
+    event["metadata"]["language"] = "french"
+    event["supported_languages"] = ["english", "unsure"]
+
+    resp = handler(event)
+    assert resp["process"] == "BLOCK"
+
+
+def test_handler_continues_when_language_supported(handler, valid_event):
+    event = copy.deepcopy(valid_event)
+    event["metadata"]["language"] = "english"
+    event["supported_languages"] = ["english", "unsure"]
+
+    resp = handler(event)
+    assert resp["process"] == "CONTINUE"
+
+
+def test_handler_continues_when_language_unsure_supported(handler, valid_event):
+    event = copy.deepcopy(valid_event)
+    event["metadata"]["language"] = "unsure"
+    event["supported_languages"] = ["english", "unsure"]
+
+    resp = handler(event)
+    assert resp["process"] == "CONTINUE"
+
+
+# ---------------- Tests: Minimum length validation ---------------- #
+def test_handler_blocks_when_insufficient_html_length(handler, valid_event, monkeypatch):
+    monkeypatch.setenv("MINIMUM_CHAR_LENGTH_HTML", "9999")  # too high
+
+    event = copy.deepcopy(valid_event)
+    event["content_type"] = "html"
+    event["extracted_text_length"] = 500
+
+    resp = handler(event)
+    assert resp["process"] == "BLOCK"
+
+
+def test_handler_continues_when_sufficient_html_length(handler, valid_event, monkeypatch):
+    monkeypatch.setenv("MINIMUM_CHAR_LENGTH_HTML", "100")
+
+    event = copy.deepcopy(valid_event)
+    event["content_type"] = "html"
+    event["extracted_text_length"] = 500
+
+    resp = handler(event)
+    assert resp["process"] == "CONTINUE"
+
+
+def test_handler_blocks_when_insufficient_pdf_length(handler, valid_event, monkeypatch):
+    monkeypatch.setenv("MINIMUM_CHAR_LENGTH_PDF", "9999")  # too high
+
+    event = copy.deepcopy(valid_event)
+    event["content_type"] = "pdf"
+    event["extracted_text_length"] = 500
+
+    resp = handler(event)
+    assert resp["process"] == "BLOCK"
+
+
+def test_handler_continues_when_sufficient_pdf_length(handler, valid_event, monkeypatch):
+    monkeypatch.setenv("MINIMUM_CHAR_LENGTH_PDF", "100")
+
+    event = copy.deepcopy(valid_event)
+    event["content_type"] = "pdf"
+    event["extracted_text_length"] = 500
+
+    resp = handler(event)
+    assert resp["process"] == "CONTINUE"
+
+
+# ---------------- Tests: Region validation (basic sanity) ---------------- #
+@pytest.mark.parametrize(
+    "docum_region, provinces, expected",
+    [
+        ("on", ["ON"], "CONTINUE"),
+        ("atl", ["NB"], "CONTINUE"),
+        ("west", ["BC"], "CONTINUE"),
+        ("on", ["BC"], "BLOCK"),
+        ("atl", ["ON"], "BLOCK"),
+        ("west", ["ON"], "BLOCK"),
+    ],
+)
+def test_region_validation(handler, valid_event, docum_region, provinces, expected):
+    event = copy.deepcopy(valid_event)
+    event["docum_region"] = docum_region
+    event["metadata"]["province"] = provinces
+
+    resp = handler(event)
+    assert resp["process"] == expected
+
